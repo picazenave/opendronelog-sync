@@ -97,32 +97,41 @@ fn is_relevant_event(event: &Event) -> bool {
 fn start_sync_watcher(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
-    folder_path: String,
+    folder_paths: Vec<String>,
     allowed_extensions: Vec<String>,
 ) -> Result<bool, String> {
     debug_log(&format!(
-        "start_sync_watcher called folder={} extensions={}",
-        folder_path,
+        "start_sync_watcher called folders={} extensions={}",
+        folder_paths.join(","),
         allowed_extensions.join(",")
     ));
 
-    let root = PathBuf::from(folder_path.trim());
-    if !root.exists() {
-        debug_log("start_sync_watcher failed: folder does not exist");
-        return Err("Selected sync folder does not exist".to_string());
+    if folder_paths.is_empty() {
+        debug_log("start_sync_watcher failed: no folders provided");
+        return Err("No folders provided to watch".to_string());
     }
-    if !root.is_dir() {
-        debug_log("start_sync_watcher failed: path is not directory");
-        return Err("Selected sync path is not a directory".to_string());
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for p in &folder_paths {
+        let pb = PathBuf::from(p.trim());
+        if !pb.exists() {
+            debug_log(&format!("start_sync_watcher failed: folder does not exist {}", p));
+            return Err(format!("Selected sync folder does not exist: {}", p));
+        }
+        if !pb.is_dir() {
+            debug_log(&format!("start_sync_watcher failed: path is not directory {}", p));
+            return Err(format!("Selected sync path is not a directory: {}", p));
+        }
+        roots.push(pb);
     }
 
     let allowed = Arc::new(normalize_extension_set(&allowed_extensions));
-    let root_dir = Arc::new(root.clone());
+    let roots_arc = Arc::new(roots.clone());
     let last_emit_at = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(2)));
 
     let app_for_events = app.clone();
     let allowed_for_events = Arc::clone(&allowed);
-    let root_for_events = Arc::clone(&root_dir);
+    let roots_for_events = Arc::clone(&roots_arc);
     let last_emit_for_events = Arc::clone(&last_emit_at);
 
     let mut watcher = RecommendedWatcher::new(
@@ -143,7 +152,15 @@ fn start_sync_watcher(
             let mut matched = false;
 
             for path in &event.paths {
-                if !path.starts_with(root_for_events.as_path()) {
+                // Check if this event path is under any of the configured roots.
+                let mut under_root = false;
+                for root in roots_for_events.iter() {
+                    if path.starts_with(root.as_path()) {
+                        under_root = true;
+                        break;
+                    }
+                }
+                if !under_root {
                     continue;
                 }
 
@@ -180,9 +197,12 @@ fn start_sync_watcher(
     )
     .map_err(|e| format!("Failed to create watcher: {}", e))?;
 
-    watcher
-        .watch(root_dir.as_path(), RecursiveMode::NonRecursive)
-        .map_err(|e| format!("Failed to watch folder: {}", e))?;
+    // Watch each root path using the same watcher instance.
+    for root in roots.iter() {
+        watcher
+            .watch(root.as_path(), RecursiveMode::NonRecursive)
+            .map_err(|e| format!("Failed to watch folder {}: {}", root.display(), e))?;
+    }
 
     let mut guard = state
         .watcher
@@ -208,19 +228,27 @@ fn stop_sync_watcher(state: tauri::State<'_, AppState>) -> Result<bool, String> 
 
 #[tauri::command]
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn pick_sync_folder_native() -> Result<Option<String>, String> {
-    debug_log("pick_sync_folder_native called");
-    let picked = rfd::FileDialog::new().set_title("Select Sync Folder").pick_folder();
-    let result = picked.map(|p| p.to_string_lossy().to_string());
-    debug_log(&format!("pick_sync_folder_native result={}", result.as_deref().unwrap_or("<cancelled>")));
-    Ok(result)
+fn pick_sync_folders_native() -> Result<Vec<String>, String> {
+    debug_log("pick_sync_folders_native called");
+    // rfd supports selecting multiple folders via pick_folders; fall back to single pick_folder
+    let mut paths: Vec<String> = Vec::new();
+    // Try pick_folders (may not be available on all backends)
+    if let Some(selected) = rfd::FileDialog::new().set_title("Select Sync Folders").pick_folders() {
+        for p in selected {
+            paths.push(p.to_string_lossy().to_string());
+        }
+    } else if let Some(p) = rfd::FileDialog::new().set_title("Select Sync Folder").pick_folder() {
+        paths.push(p.to_string_lossy().to_string());
+    }
+    debug_log(&format!("pick_sync_folders_native result_count={}", paths.len()));
+    Ok(paths)
 }
 
 #[tauri::command]
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn pick_sync_folder_native() -> Result<Option<String>, String> {
-    debug_log("pick_sync_folder_native unsupported on this platform");
-    Ok(None)
+fn pick_sync_folders_native() -> Result<Vec<String>, String> {
+    debug_log("pick_sync_folders_native unsupported on this platform");
+    Ok(Vec::new())
 }
 
 #[tauri::command]
@@ -524,7 +552,7 @@ pub fn run() {
             upload_sync_file,
             upload_sync_file_bytes,
             get_default_mobile_sync_folder,
-            pick_sync_folder_native,
+            pick_sync_folders_native,
             start_sync_watcher,
             stop_sync_watcher
         ])

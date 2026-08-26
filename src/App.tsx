@@ -5,6 +5,9 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   ChevronDown,
   ChevronRight,
+  ArrowUp,
+  ArrowDown,
+  Trash2,
   Copy,
   Folder,
   Moon,
@@ -86,7 +89,7 @@ function App() {
   const [selectedProfile, setSelectedProfile] = useState("");
   const [password, setPassword] = useState("");
   const [serverInput, setServerInput] = useState(config.serverUrl);
-  const [folderInput, setFolderInput] = useState(config.syncFolder);
+  const [folderInput, setFolderInput] = useState(config.syncFolders && config.syncFolders.length ? config.syncFolders[0] : "");
   const [allowedExtensions, setAllowedExtensions] = useState<string[]>([]);
   const [files, setFiles] = useState<SyncItem[]>([]);
   const [busy, setBusy] = useState(false);
@@ -156,7 +159,7 @@ function App() {
       serverUrl: config.serverUrl,
       activeProfile: config.activeProfile,
       hasSession: Boolean(config.sessionToken),
-      syncFolder: config.syncFolder,
+      syncFolders: config.syncFolders,
       theme: config.theme,
     });
   }, [config]);
@@ -169,8 +172,8 @@ function App() {
 
   useEffect(() => {
     const setup = async () => {
-      if (screen !== "dashboard" || !config.syncFolder) {
-        debugLog("watcher.stop.conditions", { screen, hasSyncFolder: Boolean(config.syncFolder) });
+      if (screen !== "dashboard" || !config.syncFolders?.length) {
+        debugLog("watcher.stop.conditions", { screen, hasSyncFolders: Boolean(config.syncFolders && config.syncFolders.length) });
         await stopWatcherIfRunning();
         return;
       }
@@ -191,7 +194,7 @@ function App() {
       await stopWatcherIfRunning();
 
       const exts = await ensureAllowedExtensions();
-      debugLog("watcher.desktop.setup", { folder: config.syncFolder, extensions: exts });
+      debugLog("watcher.desktop.setup", { folders: config.syncFolders, extensions: exts });
       let unlisten: UnlistenFn | null = null;
       try {
         unlisten = await listen("sync-folder-changed", () => {
@@ -205,10 +208,10 @@ function App() {
 
       try {
         await invoke("start_sync_watcher", {
-          folderPath: config.syncFolder,
+          folderPaths: config.syncFolders,
           allowedExtensions: exts,
         });
-        debugLog("watcher.desktop.started", { folder: config.syncFolder });
+        debugLog("watcher.desktop.started", { folders: config.syncFolders });
 
         watcherCleanupRef.current = async () => {
           if (unlisten) unlisten();
@@ -234,7 +237,7 @@ function App() {
       void stopWatcherIfRunning();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [screen, config.serverUrl, config.activeProfile, config.sessionToken, config.syncFolder, mobile]);
+  }, [screen, config.serverUrl, config.activeProfile, config.sessionToken, JSON.stringify(config.syncFolders), mobile]);
 
   async function stopWatcherIfRunning(): Promise<void> {
     if (!watcherCleanupRef.current) return;
@@ -303,8 +306,8 @@ function App() {
       }
 
       setInitProgress({ percent: 78, label: "Restoring sync view..." });
-      setScreen(config.syncFolder ? "dashboard" : "folder");
-      if (config.syncFolder) {
+      setScreen(config.syncFolders && config.syncFolders.length ? "dashboard" : "folder");
+      if (config.syncFolders && config.syncFolders.length) {
         await refreshSyncState(false);
       }
       setInitProgress({ percent: 100, label: "Ready" });
@@ -383,7 +386,7 @@ function App() {
         serverUrl: clean,
         activeProfile: "",
         sessionToken: "",
-        syncFolder: "",
+        syncFolders: [],
       }));
       setPassword("");
       setMessage("");
@@ -418,8 +421,8 @@ function App() {
       debugLog("login.done", { profile: result.name, hasSession: Boolean(nextToken), extensionsCount: exts.length });
       setPassword("");
       setMessage("");
-      setScreen(config.syncFolder ? "dashboard" : "folder");
-      if (config.syncFolder) {
+      setScreen(config.syncFolders && config.syncFolders.length ? "dashboard" : "folder");
+      if (config.syncFolders && config.syncFolders.length) {
         await refreshSyncState(false);
       }
     } catch (err) {
@@ -459,21 +462,26 @@ function App() {
 
     setBusy(true);
     try {
-      const selected = await withTimeout(
-        invoke<string | null>("pick_sync_folder_native"),
-        12000,
-        "Native folder picker timed out",
-      );
-      if (typeof selected === "string" && selected.trim()) {
-        setFolderInput(selected);
-        debugLog("folder.pick.desktop.done", { folder: selected });
+      const selected = await invoke<string[]>("pick_sync_folders_native");
+      if (Array.isArray(selected) && selected.length) {
+        // Add all selected folders to config (avoid duplicates)
+        setConfig((prev) => {
+          const existing = new Set(prev.syncFolders ?? []);
+          for (const s of selected) {
+            if (typeof s === "string" && s.trim()) existing.add(s.trim());
+          }
+          return { ...prev, syncFolders: Array.from(existing) };
+        });
+        setFolderInput(selected[0]);
+        debugLog("folder.pick.desktop.done", { folders: selected });
+        await refreshSyncState(true);
       } else {
         debugLog("folder.pick.desktop.cancelled");
       }
     } catch (err) {
       const errorText = asError(err);
       debugLog("folder.pick.desktop.failed", { error: errorText });
-      setMessage(`Folder picker failed on this Linux environment. Paste the folder path manually. ${errorText}`);
+      setMessage(`Folder picker failed. Paste the folder path manually. ${errorText}`);
     } finally {
       setBusy(false);
     }
@@ -498,12 +506,58 @@ function App() {
     mobileFilePayloadByPathRef.current = {};
     recentlyUploadedHashesRef.current.clear();
     debugLog("folder.save.start", { folder: selectedFolder });
-    setConfig((prev) => ({ ...prev, syncFolder: selectedFolder }));
+    setConfig((prev) => {
+      const existing = prev.syncFolders ?? [];
+      if (existing.includes(selectedFolder)) return prev;
+      return { ...prev, syncFolders: [...existing, selectedFolder] };
+    });
     setMessage("");
     setScreen("dashboard");
-    await refreshSyncState(true, selectedFolder);
+    await refreshSyncState(true);
     debugLog("folder.save.done", { folder: selectedFolder });
   }
+
+    async function removeFolder(index: number): Promise<void> {
+      const toRemove = config.syncFolders?.[index];
+      if (!toRemove) return;
+      debugLog("folder.remove.start", { index, folder: toRemove });
+      await stopWatcherIfRunning();
+      setConfig((prev) => {
+        const next = (prev.syncFolders ?? []).slice();
+        next.splice(index, 1);
+        return { ...prev, syncFolders: next };
+      });
+      // Refresh view after removal
+      await refreshSyncState(false);
+      debugLog("folder.remove.done", { folder: toRemove });
+    }
+
+    async function moveFolderUp(index: number): Promise<void> {
+      if (index <= 0) return;
+      await stopWatcherIfRunning();
+      setConfig((prev) => {
+        const next = (prev.syncFolders ?? []).slice();
+        const tmp = next[index - 1];
+        next[index - 1] = next[index];
+        next[index] = tmp;
+        return { ...prev, syncFolders: next };
+      });
+      await refreshSyncState(false);
+    }
+
+    async function moveFolderDown(index: number): Promise<void> {
+      const list = config.syncFolders ?? [];
+      if (index < 0 || index >= list.length - 1) return;
+      await stopWatcherIfRunning();
+      setConfig((prev) => {
+        const next = (prev.syncFolders ?? []).slice();
+        const tmp = next[index + 1];
+        next[index + 1] = next[index];
+        next[index] = tmp;
+        return { ...prev, syncFolders: next };
+      });
+      await refreshSyncState(false);
+    }
 
   async function refreshSyncState(showBusy = true, overrideFolder?: string): Promise<SyncItem[]> {
     if (scanInFlight.current) {
@@ -518,8 +572,8 @@ function App() {
     if (showBusy) setBusy(true);
 
     try {
-      const folderPath = overrideFolder ?? config.syncFolder;
-      if (!folderPath) {
+      const folderPaths = overrideFolder ? [overrideFolder] : (config.syncFolders ?? []);
+      if (!folderPaths.length) {
         setScreen("folder");
         setSyncProgress({ active: false, percent: 0, label: "" });
         return [];
@@ -535,7 +589,7 @@ function App() {
       setAllowedExtensions(exts);
 
       let localPromise: Promise<LocalFileEntry[]>;
-      if (mobile && isContentUri(folderPath)) {
+      if (mobile && folderPaths.length === 1 && isContentUri(folderPaths[0])) {
         localPromise = (async () => {
           setSyncProgress({ active: true, percent: 35, label: "Scanning selected mobile folder..." });
           const androidFs = await loadAndroidFsModule();
@@ -595,19 +649,29 @@ function App() {
           return files;
         })();
       } else {
-        setSyncProgress({ active: true, percent: 35, label: "Scanning local folder..." });
+        setSyncProgress({ active: true, percent: 35, label: "Scanning local folders..." });
         await waitForVisualCommit();
         debugLog("sync.refresh.scan.request.start", {
-          folderPath,
+          folders: folderPaths,
           extensions: exts,
         });
-        localPromise = invoke<LocalFileEntry[]>("scan_sync_folder", {
-          folderPath,
-          allowedExtensions: exts,
-        }).then((result) => {
+        localPromise = (async () => {
+          const results: LocalFileEntry[][] = await Promise.all(
+            folderPaths.map((fp) =>
+              invoke<LocalFileEntry[]>("scan_sync_folder", {
+                folderPath: fp,
+                allowedExtensions: exts,
+              }).catch(() => []),
+            ),
+          );
+          const merged = results.flat();
+          const map = new Map<string, LocalFileEntry>();
+          for (const f of merged) map.set(f.path, f);
+          const files = Array.from(map.values());
+          files.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
           setSyncProgress({ active: true, percent: 60, label: "Fetched local files." });
-          return result;
-        });
+          return files;
+        })();
       }
 
       const importedPromise = getServerFileHashes(config.serverUrl, config.activeProfile, config.sessionToken).then((result) => {
@@ -721,55 +785,77 @@ function App() {
 
       debugLog("sync.manual.pendingCount", { count: pending.length });
 
-      for (const file of pending) {
-        debugLog("sync.manual.upload.start", { file: file.path, hash: file.hash });
-        setUploadingPath(file.path);
-        setFiles((prev) => prev.map((item) => (item.path === file.path ? { ...item, status: "uploading" } : item)));
+      // Upload pending files with limited concurrency to improve throughput
+      const concurrency = config.uploadConcurrency ?? 3;
+      let idx = 0;
+      let unauthorized = false;
 
-        const mobilePayload = mobileFilePayloadByPathRef.current[file.path];
-        if (isContentUri(file.path) && !mobilePayload) {
-          throw new Error(`Missing mobile file payload for ${file.name}. Refresh and try again.`);
+      const next = (): typeof pending[number] | null => {
+        if (idx >= pending.length) return null;
+        const v = pending[idx];
+        idx += 1;
+        return v;
+      };
+
+      const worker = async () => {
+        while (true) {
+          if (unauthorized) return;
+          const file = next();
+          if (!file) return;
+          debugLog("sync.manual.upload.start", { file: file.path, hash: file.hash });
+          setFiles((prev) => prev.map((item) => (item.path === file.path ? { ...item, status: "uploading" } : item)));
+
+          const mobilePayload = mobileFilePayloadByPathRef.current[file.path];
+          if (isContentUri(file.path) && !mobilePayload) {
+            // mark as error
+            setFiles((prev) => prev.map((item) => (item.path === file.path ? { ...item, status: "error", message: "Missing mobile payload" } : item)));
+            continue;
+          }
+
+          try {
+            const result = isContentUri(file.path)
+              ? await uploadMobileFile(
+                  config.serverUrl,
+                  config.activeProfile,
+                  config.sessionToken,
+                  file.name,
+                  mobilePayload ? mobilePayload.bytes : new Uint8Array(),
+                  file.hash,
+                )
+              : await invoke<UploadSyncResponse>("upload_sync_file", {
+                  serverUrl: config.serverUrl,
+                  profile: config.activeProfile,
+                  sessionToken: config.sessionToken,
+                  filePath: file.path,
+                });
+
+            if (result.statusCode === 401) {
+              debugLog("sync.manual.upload.unauthorized", { file: file.path });
+              unauthorized = true;
+              setConfig((prev) => ({ ...prev, sessionToken: "" }));
+              setScreen("login");
+              setMessage("Session expired. Please login again.");
+              return;
+            }
+
+            if (!result.success) {
+              debugLog("sync.manual.upload.failed", { file: file.path, statusCode: result.statusCode, message: result.message });
+              setFiles((prev) => prev.map((item) => (item.path === file.path ? { ...item, status: "error", message: result.message } : item)));
+            } else {
+              debugLog("sync.manual.upload.done", { file: file.path, statusCode: result.statusCode });
+              recentlyUploadedHashesRef.current.add(file.hash);
+              setFiles((prev) => prev.map((item) => (item.path === file.path ? { ...item, status: "uploaded", message: "Uploaded" } : item)));
+            }
+          } catch (err) {
+            debugLog("sync.manual.upload.exception", { file: file.path, error: asError(err) });
+            setFiles((prev) => prev.map((item) => (item.path === file.path ? { ...item, status: "error", message: asError(err) } : item)));
+          }
         }
+      };
 
-        const result = isContentUri(file.path)
-          ? await uploadMobileFile(
-              config.serverUrl,
-              config.activeProfile,
-              config.sessionToken,
-              file.name,
-              mobilePayload ? mobilePayload.bytes : new Uint8Array(),
-              file.hash,
-            )
-          : await invoke<UploadSyncResponse>("upload_sync_file", {
-              serverUrl: config.serverUrl,
-              profile: config.activeProfile,
-              sessionToken: config.sessionToken,
-              filePath: file.path,
-            });
-
-        if (result.statusCode === 401) {
-          debugLog("sync.manual.upload.unauthorized", { file: file.path });
-          setConfig((prev) => ({ ...prev, sessionToken: "" }));
-          setScreen("login");
-          setMessage("Session expired. Please login again.");
-          return;
-        }
-
-        if (!result.success) {
-          debugLog("sync.manual.upload.failed", { file: file.path, statusCode: result.statusCode, message: result.message });
-          setFiles((prev) =>
-            prev.map((item) =>
-              item.path === file.path ? { ...item, status: "error", message: result.message } : item,
-            ),
-          );
-        } else {
-          debugLog("sync.manual.upload.done", { file: file.path, statusCode: result.statusCode });
-          recentlyUploadedHashesRef.current.add(file.hash);
-          setFiles((prev) =>
-            prev.map((item) => (item.path === file.path ? { ...item, status: "uploaded", message: "Uploaded" } : item)),
-          );
-        }
-      }
+      const workers: Promise<void>[] = [];
+      for (let i = 0; i < concurrency; i++) workers.push(worker());
+      await Promise.all(workers);
 
       setUploadingPath("");
       await refreshSyncState(false);
@@ -835,15 +921,37 @@ function App() {
   }
 
   function renderFolderScreen() {
+    const folders = config.syncFolders ?? [];
     return (
       <section className="card">
-        <h2><Folder size={18} /> Sync Folder</h2>
-        <p>{mobile ? "On mobile, use the app sync folder for reliable access." : "Choose the folder to watch for log files."}</p>
+        <h2><Folder size={18} /> Manage Sync Folders</h2>
+        <p>{mobile ? "On mobile, use the app sync folder for reliable access." : "Add, remove, or reorder folders to watch."}</p>
+
+        {folders.length ? (
+          <div className="folders-list">
+            {folders.map((f, i) => (
+              <div key={f} className="folder-row">
+                <span className="folder-path" title={f}>{f}</span>
+                <div className="folder-actions">
+                  <button className="ghost" onClick={() => void moveFolderUp(i)} disabled={i === 0} title="Move up"><ArrowUp size={14} /></button>
+                  <button className="ghost" onClick={() => void moveFolderDown(i)} disabled={i === folders.length - 1} title="Move down"><ArrowDown size={14} /></button>
+                  <button className="ghost danger" onClick={() => void removeFolder(i)} title="Remove"><Trash2 size={14} /></button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="empty">No sync folders configured yet.</p>
+        )}
+
         <div className="row">
-          <input value={folderInput} onChange={(e) => setFolderInput(e.target.value)} placeholder="/path/to/sync-folder" />
+          <input value={folderInput} onChange={(e) => setFolderInput(e.target.value)} placeholder="/path/to/sync-folder or mobile uri" />
           <button className="ghost" onClick={() => void pickFolder()}>Browse</button>
         </div>
-        <button disabled={busy} onClick={() => void saveFolder()}>Save Folder</button>
+        <div className="row">
+          <button disabled={busy} onClick={() => void saveFolder()}>Add Folder</button>
+          <button className="ghost" onClick={() => setScreen(folders.length ? "dashboard" : "server")}>Done</button>
+        </div>
       </section>
     );
   }
@@ -885,7 +993,7 @@ function App() {
 
         <div className="meta">
           <span>Profile: {config.activeProfile}</span>
-          <span>Folder: {config.syncFolder}</span>
+          <span>Folder: {(config.syncFolders && config.syncFolders.length) ? config.syncFolders.join(", ") : "-"}</span>
           <span>Allowed: {allowedExtensions.join(", ") || "-"}</span>
         </div>
 
@@ -986,6 +1094,20 @@ function App() {
           <button className="ghost" onClick={() => setScreen("server")}>Change Server URL</button>
           <button className="ghost" onClick={resetLogin}>Change Profile</button>
           <button className="ghost" onClick={() => setScreen("folder")}>Change Sync Folder</button>
+          <div className="setting-row">
+            <label>Upload concurrency</label>
+            <input
+              type="number"
+              min={1}
+              max={12}
+              value={config.uploadConcurrency ?? 3}
+              onChange={(e) => {
+                const v = Math.max(1, Math.min(12, Number(e.target.value) || 1));
+                setConfig((prev) => ({ ...prev, uploadConcurrency: v }));
+              }}
+            />
+            <small>Concurrent uploads when syncing</small>
+          </div>
         </section>
       ) : null}
 
@@ -1158,20 +1280,7 @@ function groupByStatus(items: SyncItem[]): Record<OrderedStatus, SyncItem[]> {
   return grouped;
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
-  let timeoutId: number | null = null;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = window.setTimeout(() => reject(new Error(errorMessage)), timeoutMs);
-  });
-
-  try {
-    return await Promise.race([promise, timeoutPromise]);
-  } finally {
-    if (timeoutId !== null) {
-      window.clearTimeout(timeoutId);
-    }
-  }
-}
+// Removed withTimeout wrapper for native pickers to avoid spurious timeouts on Windows.
 
 function waitForVisualCommit(): Promise<void> {
   return new Promise((resolve) => {
